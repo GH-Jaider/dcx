@@ -1,17 +1,24 @@
-// Package ui es la TUI (Bubble Tea) de dcx: selector de proyectos con
-// ajustes en vivo, dashboard de progreso paralelo y resumen final.
+// Package ui es la TUI (Bubble Tea v2) de dcx: selector de composiciones con
+// ajustes en vivo, dashboard de progreso paralelo y resumen final. El diseño
+// sigue el vocabulario visual del ecosistema Charm: rail de cursor ┃, radios
+// ◉/○, un solo glifo de estado coloreado, badges dark-on-green y una rampa
+// de grises adaptativa a terminal clara/oscura.
 package ui
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/progress"
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/progress"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/GH-Jaider/dcx/internal/export"
 )
@@ -45,6 +52,25 @@ type progressMsg export.Progress
 
 type engineDoneMsg struct{ err error }
 
+type flashExpiredMsg struct{}
+
+// keymaps por vista (bubbles/help los renderiza).
+var (
+	kMove   = key.NewBinding(key.WithKeys("up", "down", "k", "j"), key.WithHelp("↑↓", "mover"))
+	kToggle = key.NewBinding(key.WithKeys("space"), key.WithHelp("espacio", "marcar"))
+	kAll    = key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "todo"))
+	kAdjust = key.NewBinding(key.WithKeys("f", "s", "p", "w"), key.WithHelp("f/s/p/w", "ajustes"))
+	kStart  = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "exportar"))
+	kQuit   = key.NewBinding(key.WithKeys("q", "esc", "ctrl+c"), key.WithHelp("q", "salir"))
+	kCancel = key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "cancela"))
+	kExit   = key.NewBinding(key.WithKeys("enter", "q", "esc"), key.WithHelp("enter", "salir"))
+)
+
+type helpKeys []key.Binding
+
+func (h helpKeys) ShortHelp() []key.Binding  { return h }
+func (h helpKeys) FullHelp() [][]key.Binding { return [][]key.Binding{h} }
+
 // Model es el modelo raíz de la TUI.
 type Model struct {
 	files    []string
@@ -60,15 +86,23 @@ type Model struct {
 
 	phase     phase
 	jobs      []jobView
+	started   time.Time
 	ch        chan export.Progress
 	done      chan error
 	cancel    context.CancelFunc
 	canceling bool
 	engineErr error
+	belled    bool
 
-	bar   progress.Model
-	spin  spinner.Model
-	width int
+	pal    palette
+	bar    progress.Model
+	spin   spinner.Model
+	hlp    help.Model
+	width  int
+	height int
+
+	flashKey   string
+	flashUntil time.Time
 }
 
 // New crea el modelo con los proyectos descubiertos y las opciones iniciales.
@@ -78,9 +112,9 @@ func New(files []string, opt export.Options, meta string) Model {
 		selected: map[int]bool{},
 		opt:      opt,
 		meta:     meta,
-		bar:      progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
-		spin:     spinner.New(spinner.WithSpinner(spinner.MiniDot)),
+		hlp:      help.New(),
 		width:    100,
+		height:   32,
 	}
 	for i := range files {
 		m.selected[i] = true
@@ -93,7 +127,18 @@ func New(files []string, opt export.Options, meta string) Model {
 			m.presetIdx = i
 		}
 	}
+	m.applyTheme(true)
 	return m
+}
+
+// applyTheme reconstruye paleta y componentes al saber el fondo del terminal.
+func (m *Model) applyTheme(isDark bool) {
+	m.pal = newPalette(isDark)
+	stops, empty := m.pal.barColors()
+	m.bar = progress.New(progress.WithColors(stops...), progress.WithoutPercentage())
+	m.bar.EmptyColor = empty
+	m.spin = spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(m.pal.glyphOn))
+	m.hlp.Styles = help.DefaultStyles(isDark)
 }
 
 func indexOf(xs []int, v int) int {
@@ -107,7 +152,7 @@ func indexOf(xs []int, v int) int {
 
 // Run lanza el programa Bubble Tea y devuelve el error del export (si hubo).
 func Run(files []string, opt export.Options, meta string) error {
-	final, err := tea.NewProgram(New(files, opt, meta), tea.WithAltScreen()).Run()
+	final, err := tea.NewProgram(New(files, opt, meta)).Run()
 	if err != nil {
 		return err
 	}
@@ -117,7 +162,9 @@ func Run(files []string, opt export.Options, meta string) error {
 	return nil
 }
 
-func (m Model) Init() tea.Cmd { return m.spin.Tick }
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(tea.RequestBackgroundColor, m.spin.Tick)
+}
 
 func listen(ch <-chan export.Progress, done <-chan error) tea.Cmd {
 	return func() tea.Msg {
@@ -135,15 +182,21 @@ func listen(ch <-chan export.Progress, done <-chan error) tea.Cmd {
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.BackgroundColorMsg:
+		m.applyTheme(msg.IsDark())
+		return m, m.spin.Tick
+
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.bar.Width = min(36, max(10, msg.Width-56))
+		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
 		return m, cmd
+
+	case flashExpiredMsg:
+		return m, nil
 
 	case progressMsg:
 		p := export.Progress(msg)
@@ -162,31 +215,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case engineDoneMsg:
 		m.engineErr = msg.err
 		m.phase = phaseDone
+		if !m.belled {
+			m.belled = true
+			fmt.Fprint(os.Stderr, "\a")
+		}
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
 	return m, nil
 }
 
-func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	key := msg.String()
-	if key == "ctrl+c" {
-		if m.phase == phaseRun {
-			return m.cancelRun()
-		}
-		return m, tea.Quit
-	}
+func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch m.phase {
 	case phasePick:
-		return m.handlePickKey(key)
+		return m.handlePickKey(msg)
 	case phaseRun:
-		if key == "q" {
+		if key.Matches(msg, kCancel) {
 			return m.cancelRun()
 		}
 	case phaseDone:
-		if key == "q" || key == "enter" || key == "esc" {
+		if key.Matches(msg, kExit) || key.Matches(msg, kQuit) {
 			return m, tea.Quit
 		}
 	}
@@ -201,21 +251,24 @@ func (m Model) cancelRun() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) handlePickKey(key string) (tea.Model, tea.Cmd) {
-	switch key {
-	case "q", "esc":
+func (m Model) handlePickKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, kQuit):
 		return m, tea.Quit
-	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
+	case key.Matches(msg, kMove):
+		switch msg.String() {
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		default:
+			if m.cursor < len(m.files)-1 {
+				m.cursor++
+			}
 		}
-	case "down", "j":
-		if m.cursor < len(m.files)-1 {
-			m.cursor++
-		}
-	case " ":
+	case key.Matches(msg, kToggle):
 		m.selected[m.cursor] = !m.selected[m.cursor]
-	case "a":
+	case key.Matches(msg, kAll):
 		all := true
 		for i := range m.files {
 			if !m.selected[i] {
@@ -226,26 +279,33 @@ func (m Model) handlePickKey(key string) (tea.Model, tea.Cmd) {
 		for i := range m.files {
 			m.selected[i] = !all
 		}
-	case "f":
-		m.fpsIdx = (m.fpsIdx + 1) % len(fpsOptions)
-		m.opt.FPS = fpsOptions[m.fpsIdx]
-	case "s":
-		m.scaleIdx = (m.scaleIdx + 1) % len(scaleOptions)
-		m.opt.Scale = scaleOptions[m.scaleIdx]
-	case "p":
-		all := export.Presets()
-		for i := 1; i <= len(all); i++ {
-			idx := (m.presetIdx + i) % len(all)
-			if all[idx].Supported(m.opt.Caps) {
-				m.presetIdx = idx
-				m.opt.Preset = all[idx]
-				break
+	case key.Matches(msg, kAdjust):
+		k := msg.String()
+		switch k {
+		case "f":
+			m.fpsIdx = (m.fpsIdx + 1) % len(fpsOptions)
+			m.opt.FPS = fpsOptions[m.fpsIdx]
+		case "s":
+			m.scaleIdx = (m.scaleIdx + 1) % len(scaleOptions)
+			m.opt.Scale = scaleOptions[m.scaleIdx]
+		case "p":
+			all := export.Presets()
+			for i := 1; i <= len(all); i++ {
+				idx := (m.presetIdx + i) % len(all)
+				if all[idx].Supported(m.opt.Caps) {
+					m.presetIdx = idx
+					m.opt.Preset = all[idx]
+					break
+				}
 			}
+		case "w":
+			m.workersIdx = (m.workersIdx + 1) % len(workerRange)
+			m.opt.Workers = workerRange[m.workersIdx]
 		}
-	case "w":
-		m.workersIdx = (m.workersIdx + 1) % len(workerRange)
-		m.opt.Workers = workerRange[m.workersIdx]
-	case "enter":
+		m.flashKey = k
+		m.flashUntil = time.Now().Add(850 * time.Millisecond)
+		return m, tea.Tick(900*time.Millisecond, func(time.Time) tea.Msg { return flashExpiredMsg{} })
+	case key.Matches(msg, kStart):
 		return m.startRun()
 	}
 	return m, nil
@@ -265,6 +325,7 @@ func (m Model) startRun() (tea.Model, tea.Cmd) {
 	for i, p := range picked {
 		m.jobs[i] = jobView{path: p, stage: export.StagePending}
 	}
+	m.started = time.Now()
 	m.ch = make(chan export.Progress, 256)
 	m.done = make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -281,14 +342,8 @@ func (m Model) startRun() (tea.Model, tea.Cmd) {
 
 // ── vistas ──
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
 	var b strings.Builder
-	header := titleStyle.Render("dcx") + subtleStyle.Render("  ·  .dc.html → video")
-	if m.meta != "" {
-		header += subtleStyle.Render("  ·  " + m.meta)
-	}
-	b.WriteString(headerBox.Render(header))
-	b.WriteString("\n")
 	switch m.phase {
 	case phasePick:
 		m.viewPick(&b)
@@ -297,116 +352,226 @@ func (m Model) View() string {
 	case phaseDone:
 		m.viewRun(&b, true)
 	}
-	return containerBox.Render(b.String())
+	v := tea.NewView(m.pal.root.Render(b.String()))
+	v.AltScreen = true
+	return v
+}
+
+// header compone el chip de marca + metadatos separados por · .
+func (m Model) header(parts ...string) string {
+	sep := m.pal.dotSep.Render(" · ")
+	metas := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			metas = append(metas, m.pal.meta.Render(p))
+		}
+	}
+	return m.pal.chip.Render("dcx") + " " + m.pal.slashes.Render("╱╱") + "  " + strings.Join(metas, sep)
 }
 
 func (m Model) settingsLine() string {
-	p := m.opt.Preset
-	enc := "software"
-	if _, hw := p.Args(m.opt.Caps); hw {
-		enc = "videotoolbox"
+	item := func(k, v string) string {
+		vs := m.pal.settingVal
+		if m.flashKey == k && time.Now().Before(m.flashUntil) {
+			vs = m.pal.settingHot
+		}
+		return m.pal.settingKey.Render(k) + " " + vs.Render(v)
 	}
-	return settingStyle.Render(fmt.Sprintf("%s %d fps   %s %dx   %s %s   %s %d workers",
-		settingKey.Render("f"), m.opt.FPS,
-		settingKey.Render("s"), m.opt.Scale,
-		settingKey.Render("p"), p.Name,
-		settingKey.Render("w"), m.opt.Workers,
-	)) + subtleStyle.Render("   "+enc)
+	enc := m.pal.encoderSW.Render("software")
+	if _, hw := m.opt.Preset.Args(m.opt.Caps); hw {
+		enc = m.pal.encoderHW.Render("videotoolbox")
+	}
+	return strings.Join([]string{
+		item("f", fmt.Sprintf("%d fps", m.opt.FPS)),
+		item("s", fmt.Sprintf("%d×", m.opt.Scale)),
+		item("p", m.opt.Preset.Name),
+		item("w", fmt.Sprintf("%d workers", m.opt.Workers)),
+		enc,
+	}, "   ")
 }
 
+func (m Model) helpLine(ks ...key.Binding) string {
+	return lipglossMarginTop(m.hlp.View(helpKeys(ks)))
+}
+
+func lipglossMarginTop(s string) string { return "\n" + s }
+
 func (m Model) viewPick(b *strings.Builder) {
-	b.WriteString(m.settingsLine() + "\n\n")
-	for i, f := range m.files {
-		cursor := "  "
-		if i == m.cursor {
-			cursor = cursorStyle.Render("❯ ")
-		}
-		check := dimFileStyle.Render("[ ]")
-		name := dimFileStyle.Render(displayName(f))
+	nSel := 0
+	for i := range m.files {
 		if m.selected[i] {
-			check = checkedStyle.Render("[✓]")
-			name = fileStyle.Render(displayName(f))
+			nSel++
 		}
-		fmt.Fprintf(b, "%s%s %s\n", cursor, check, name)
 	}
-	b.WriteString(helpStyle.Render("↑↓ mover · espacio marcar · a todos/ninguno · f/s/p/w ajustes · enter exportar · q salir"))
+	b.WriteString(m.header(
+		fmt.Sprintf("%d %s", len(m.files), plural(len(m.files), "composición", "composiciones")),
+		fmt.Sprintf("%d %s", nSel, plural(nSel, "marcada", "marcadas")),
+		m.meta,
+	))
+	b.WriteString("\n\n")
+	b.WriteString(m.settingsLine())
+	b.WriteString("\n\n")
+	nameW := max(12, m.width-10)
+	for i, f := range m.files {
+		rail := "  "
+		if i == m.cursor {
+			rail = m.pal.rail.Render("┃") + " "
+		}
+		glyph := m.pal.glyphOff.Render("○")
+		style := m.pal.rowMuted
+		if m.selected[i] {
+			glyph = m.pal.glyphOn.Render("◉")
+			style = m.pal.rowBase
+		}
+		if i == m.cursor {
+			style = style.Bold(true)
+		}
+		name := ansi.Truncate(displayName(f), nameW, "…")
+		fmt.Fprintf(b, "%s%s %s\n", rail, glyph, style.Render(name))
+	}
+	b.WriteString(m.helpLine(kToggle, kAll, kAdjust, kStart, kQuit))
 }
 
 func (m Model) viewRun(b *strings.Builder, done bool) {
-	b.WriteString(m.settingsLine() + "\n\n")
+	finished := 0
 	for _, j := range m.jobs {
-		b.WriteString(m.jobLine(j) + "\n")
+		if j.stage == export.StageDone || j.stage == export.StageFailed {
+			finished++
+		}
 	}
+	b.WriteString(m.header(
+		fmt.Sprintf("exportando %d/%d", finished, len(m.jobs)),
+		m.opt.Preset.Name,
+		fmt.Sprintf("%d workers", m.opt.Workers),
+	))
+	b.WriteString("\n\n")
+
+	// columnas: [glifo 1] [nombre nameW] [barra] [pct 5] [extra]
+	longest := 0
+	for _, j := range m.jobs {
+		longest = max(longest, len([]rune(displayName(j.path))))
+	}
+	nameW := clamp(longest, 12, 28)
+	if m.width < 80 {
+		nameW = min(nameW, 18)
+	}
+	showFrames := m.width >= 88
+	showEta := m.width >= 100
+	extraW := 24
+	barW := max(10, m.width-4-2-nameW-1-6-1-extraW)
+	bar := m.bar
+	bar.SetWidth(barW)
+
+	for _, j := range m.jobs {
+		b.WriteString(m.jobLine(j, bar, nameW, barW, showFrames, showEta))
+		b.WriteString("\n")
+	}
+
 	if done {
-		var ok, failed int
-		for _, j := range m.jobs {
-			if j.err != nil {
-				failed++
-			} else if j.stage == export.StageDone {
-				ok++
-			}
-		}
-		summary := fmt.Sprintf("%d listos", ok)
-		if failed > 0 {
-			summary += errStyle.Render(fmt.Sprintf(" · %d con error", failed))
-		}
-		b.WriteString("\n" + okStyle.Render("● ") + summary)
-		b.WriteString(helpStyle.Render("q para salir"))
+		m.viewSummary(b)
 	} else if m.canceling {
-		b.WriteString(helpStyle.Render("cancelando…"))
+		b.WriteString("\n" + m.pal.quiet.Render("cancelando…"))
 	} else {
-		b.WriteString(helpStyle.Render("q cancela"))
+		b.WriteString(m.helpLine(kCancel))
 	}
 }
 
-func (m Model) jobLine(j jobView) string {
-	name := truncate(displayName(j.path), 28)
+func (m Model) jobLine(j jobView, bar progress.Model, nameW, barW int, showFrames, showEta bool) string {
+	name := ansi.Truncate(displayName(j.path), nameW, "…")
+	pad := strings.Repeat(" ", nameW-ansi.StringWidth(name))
+	pct := func(p float64) string {
+		return m.pal.subtle.Render(fmt.Sprintf("%4.0f%%", p*100))
+	}
 	switch {
 	case j.err != nil:
-		return fmt.Sprintf("%s %-28s %s", errStyle.Render("✗"), name, errStyle.Render(truncate(j.err.Error(), max(20, m.width-40))))
+		msg := ansi.Truncate(j.err.Error(), max(20, m.width-nameW-12), "…")
+		return m.pal.errText.Render("×") + " " + m.pal.rowBase.Render(name) + pad + " " + m.pal.errText.Render(msg)
 	case j.stage == export.StageDone:
-		return fmt.Sprintf("%s %-28s %s %s",
-			okStyle.Render("✓"), name,
-			outPathStyle.Render(filepath.Base(j.out)),
-			subtleStyle.Render(fmt.Sprintf("(%s · %s)", humanBytes(j.bytes), j.elapsed.Round(time.Second))))
-	case j.stage == export.StagePending:
-		return fmt.Sprintf("%s %-28s %s", subtleStyle.Render("·"), name, stageStyle.Render(j.stage.String()))
-	default:
-		pct := 0.0
-		extra := ""
-		if j.frames > 0 {
-			pct = float64(j.frame) / float64(j.frames)
-			extra = subtleStyle.Render(fmt.Sprintf(" %d/%d%s", j.frame, j.frames, eta(j)))
+		// truncar la cola al ancho restante para no desbordar la fila
+		meta := fmt.Sprintf("  %s · %s", humanBytes(j.bytes), j.elapsed.Round(time.Second))
+		avail := m.width - 4 - 2 - nameW - 1 - barW - 1 - 5 - 4 - ansi.StringWidth(meta)
+		tail := ""
+		if avail >= 10 {
+			tail = m.pal.faint.Render("→ ") + m.pal.subtle.Render(ansi.Truncate(filepath.Base(j.out), avail, "…")) + m.pal.faint.Render(meta)
+		} else if avail+ansi.StringWidth(meta) >= 10 {
+			tail = m.pal.faint.Render("→ ") + m.pal.subtle.Render(ansi.Truncate(filepath.Base(j.out), avail+ansi.StringWidth(meta), "…"))
 		}
-		return fmt.Sprintf("%s %-28s %s %s%s",
-			checkedStyle.Render(m.spin.View()), name,
-			m.bar.ViewAs(pct),
-			percentStyle.Render(fmt.Sprintf("%3.0f%%", pct*100)),
-			extra)
+		return m.pal.ok.Render("✓") + " " + m.pal.rowBase.Render(name) + pad + " " +
+			m.pal.barDone.Render(strings.Repeat("█", barW)) + " " + pct(1) + "  " + tail
+	case j.stage == export.StagePending:
+		return m.pal.glyphWait.Render("●") + " " + m.pal.rowMuted.Render(name) + pad + " " +
+			bar.ViewAs(0) + " " + strings.Repeat(" ", 5) + " " + m.pal.faint.Render("en cola")
+	case j.stage == export.StageBooting:
+		return m.spin.View() + " " + m.pal.rowBase.Render(name) + pad + " " +
+			bar.ViewAs(0) + " " + strings.Repeat(" ", 5) + " " + m.pal.faint.Render("arrancando")
+	case j.stage == export.StageEncoding:
+		return m.spin.View() + " " + m.pal.rowBase.Render(name) + pad + " " +
+			bar.ViewAs(1) + " " + pct(1) + " " + m.pal.faint.Render("codificando")
+	default: // rendering
+		p := 0.0
+		if j.frames > 0 {
+			p = float64(j.frame) / float64(j.frames)
+		}
+		extra := ""
+		if showFrames && j.frames > 0 {
+			extra = m.pal.subtle.Render(fmt.Sprintf(" %d/%d", j.frame, j.frames))
+		}
+		if showEta && j.frame > 0 && j.elapsed > 0 && j.stage == export.StageRendering {
+			frac := float64(j.frame) / float64(j.frames)
+			rest := time.Duration(float64(j.elapsed)/frac - float64(j.elapsed))
+			extra += m.pal.faint.Render(fmt.Sprintf(" · eta %s", rest.Round(time.Second)))
+		}
+		return m.spin.View() + " " + m.pal.rowBase.Render(name) + pad + " " +
+			bar.ViewAs(p) + " " + pct(p) + extra
 	}
 }
 
-func eta(j jobView) string {
-	if j.frame == 0 || j.frames == 0 || j.elapsed == 0 || j.stage != export.StageRendering {
-		return ""
+func (m Model) viewSummary(b *strings.Builder) {
+	var ok, failed int
+	var bytes int64
+	for _, j := range m.jobs {
+		switch {
+		case j.err != nil:
+			failed++
+		case j.stage == export.StageDone:
+			ok++
+			bytes += j.bytes
+		}
 	}
-	frac := float64(j.frame) / float64(j.frames)
-	rest := time.Duration(float64(j.elapsed)/frac - float64(j.elapsed))
-	return fmt.Sprintf(" · eta %s", rest.Round(time.Second))
+	b.WriteString("\n" + m.pal.hairSep.Render(strings.Repeat("─", max(20, m.width-4))) + "\n\n")
+	badge := m.pal.badgeOK.Render("LISTO")
+	if ok == 0 && failed > 0 {
+		badge = m.pal.badgeErr.Render("ERROR")
+	}
+	total := m.pal.rowBase.Render(fmt.Sprintf("%d %s", ok, plural(ok, "exportado", "exportados"))) +
+		m.pal.faint.Render(fmt.Sprintf(" · %s · %s", humanBytes(bytes), time.Since(m.started).Round(time.Second)))
+	line := badge + "  " + total
+	if failed > 0 {
+		line += m.pal.errText.Render(fmt.Sprintf("   × %d con error", failed))
+	}
+	b.WriteString(line)
+	b.WriteString(m.helpLine(kExit))
 }
 
 func displayName(p string) string {
 	return strings.TrimSuffix(filepath.Base(p), ".dc.html")
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
 	}
-	if n <= 1 {
-		return "…"
+	return many
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
 	}
-	return s[:n-1] + "…"
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func humanBytes(n int64) string {
