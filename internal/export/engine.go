@@ -61,13 +61,14 @@ func (s Stage) String() string {
 
 // Options controla el export.
 type Options struct {
-	FPS        int
-	Scale      int // factor de resolución: 2 = un lienzo 1080 sale a 2160
-	Preset     Preset
-	Workers    int
-	MaxSeconds float64 // >0 corta el export (para pruebas)
-	ChromePath string  // vacío = autodetectar
-	OutDir     string  // vacío = junto a cada proyecto
+	FPS         int
+	Scale       int // factor de resolución: 2 = un lienzo 1080 sale a 2160
+	Preset      Preset
+	Caps        Caps // encoders por hardware del ffmpeg local (DetectCaps)
+	Workers     int
+	MaxSeconds  float64 // >0 corta el export (para pruebas)
+	BrowserPath string  // resuelto por internal/browser; vacío = que chromedp busque
+	OutDir      string  // vacío = junto a cada proyecto
 }
 
 // Progress es un reporte de avance de un job (se emite desde varias goroutines).
@@ -101,8 +102,8 @@ func Run(ctx context.Context, projects []string, opt Options, report func(Progre
 		return errors.New("ffmpeg no está en el PATH (brew install ffmpeg)")
 	}
 	allocOpts := chromedp.DefaultExecAllocatorOptions[:]
-	if opt.ChromePath != "" {
-		allocOpts = append(allocOpts, chromedp.ExecPath(opt.ChromePath))
+	if opt.BrowserPath != "" {
+		allocOpts = append(allocOpts, chromedp.ExecPath(opt.BrowserPath))
 	}
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, allocOpts...)
 	defer cancelAlloc()
@@ -184,13 +185,28 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 	})()`
 	var duration float64
 	var box svgBox
+	var syncSeek bool
 	if err := chromedp.Run(bootCtx,
 		emulation.SetDeviceMetricsOverride(1400, 1400, float64(opt.Scale), false),
 		chromedp.Navigate(pageURL),
 		chromedp.Poll(`!!document.querySelector('`+sel+`')`, nil, chromedp.WithPollingInterval(150*time.Millisecond)),
 		chromedp.Evaluate(prep, nil, awaitPromise),
-		chromedp.Sleep(800*time.Millisecond),
+	); err != nil {
+		return fail(fmt.Errorf("arrancando la composición: %w", err))
+	}
+	// El runtime inyecta las @font-face dentro del svg y lo marca; esperarlo
+	// evita frames tempranos con fuentes de fallback. Best-effort con timeout
+	// corto: un runtime viejo sin el atributo no debe pagar una espera larga
+	// (document.fonts.ready ya se esperó arriba).
+	fontsCtx, cancelFonts := context.WithTimeout(tabCtx, 4*time.Second)
+	_ = chromedp.Run(fontsCtx, chromedp.Poll(
+		`document.querySelector('`+sel+`').getAttribute('data-om-fonts-inlined') === 'true'`,
+		nil, chromedp.WithPollingInterval(100*time.Millisecond)))
+	cancelFonts()
+	if err := chromedp.Run(bootCtx,
+		chromedp.Sleep(150*time.Millisecond),
 		chromedp.Evaluate(`+document.querySelector('`+sel+`').getAttribute('data-om-exportable-video-with-duration-secs')`, &duration),
+		chromedp.Evaluate(`document.querySelector('`+sel+`').getAttribute('data-om-sync-seek') === 'true'`, &syncSeek),
 		chromedp.Evaluate(`(() => { const r = document.querySelector('`+sel+`').getBoundingClientRect(); return {x: r.x, y: r.y, w: r.width, h: r.height}; })()`, &box),
 	); err != nil {
 		return fail(fmt.Errorf("arrancando la composición: %w", err))
@@ -204,8 +220,14 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 	}
 
 	out := OutputPath(project, opt)
+	if opt.Preset.Seq {
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			return fail(err)
+		}
+	}
+	ffArgs, _ := ffmpegArgs(opt, out)
 	var ffErr bytes.Buffer
-	ff := exec.CommandContext(appCtx, "ffmpeg", ffmpegArgs(opt, out)...)
+	ff := exec.CommandContext(appCtx, "ffmpeg", ffArgs...)
 	ff.Stderr = &ffErr
 	stdin, err := ff.StdinPipe()
 	if err != nil {
@@ -224,24 +246,30 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 	}
 
 	clip := &page.Viewport{X: box.X, Y: box.Y, Width: box.W, Height: box.H, Scale: 1}
+	// Sin flushSync anunciado (data-om-sync-seek) el commit del seek es
+	// asíncrono: hay que dejar pasar dos frames de compositor antes de capturar.
+	const rafSettle = `(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))))()`
 	for i := 0; i < frames; i++ {
 		if err := appCtx.Err(); err != nil {
 			return ffFail(err)
 		}
 		t := math.Min(float64(i)/float64(opt.FPS), duration-1e-4)
 		seek := fmt.Sprintf(`document.querySelector('%s').dispatchEvent(new CustomEvent('data-om-seek-to-time-frame', { detail: { time: %g, sync: true } }))`, sel, t)
+		actions := []chromedp.Action{chromedp.Evaluate(seek, nil)}
+		if !syncSeek {
+			actions = append(actions, chromedp.Evaluate(rafSettle, nil, awaitPromise))
+		}
 		var shot []byte
-		if err := chromedp.Run(tabCtx,
-			chromedp.Evaluate(seek, nil),
-			chromedp.ActionFunc(func(c context.Context) error {
-				var err error
-				shot, err = page.CaptureScreenshot().
-					WithFormat(page.CaptureScreenshotFormatPng).
-					WithClip(clip).
-					Do(c)
-				return err
-			}),
-		); err != nil {
+		actions = append(actions, chromedp.ActionFunc(func(c context.Context) error {
+			var err error
+			shot, err = page.CaptureScreenshot().
+				WithFormat(page.CaptureScreenshotFormatPng).
+				WithOptimizeForSpeed(true).
+				WithClip(clip).
+				Do(c)
+			return err
+		}))
+		if err := chromedp.Run(tabCtx, actions...); err != nil {
 			return ffFail(err)
 		}
 		if _, err := stdin.Write(shot); err != nil {
@@ -258,10 +286,29 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 		}
 		return fail(fmt.Errorf("ffmpeg: %w", err))
 	}
-	var size int64
-	if fi, err := os.Stat(out); err == nil {
-		size = fi.Size()
-	}
-	report(Progress{Job: job, Stage: StageDone, Frame: frames, Frames: frames, Out: out, Bytes: size, Elapsed: time.Since(start)})
+	report(Progress{Job: job, Stage: StageDone, Frame: frames, Frames: frames, Out: out, Bytes: outputSize(out), Elapsed: time.Since(start)})
 	return nil
+}
+
+// outputSize mide el resultado: tamaño del archivo, o suma del directorio
+// para secuencias.
+func outputSize(out string) int64 {
+	fi, err := os.Stat(out)
+	if err != nil {
+		return 0
+	}
+	if !fi.IsDir() {
+		return fi.Size()
+	}
+	var total int64
+	entries, err := os.ReadDir(out)
+	if err != nil {
+		return 0
+	}
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
 }

@@ -23,8 +23,21 @@ en su tab (proceso renderer independiente de Chrome).
 
 ## Requisitos
 
-- Google Chrome (o Chromium; se autodetecta, o `--chrome /ruta`)
 - `ffmpeg` en el PATH (`brew install ffmpeg`)
+- Motor de render: dcx se lo consigue solo. Orden de resolución: `--browser`
+  / env `DCX_BROWSER` → `chrome-headless-shell` cacheado (versión pineada de
+  [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/),
+  ~95 MB descargados una sola vez a la caché de usuario) → Chrome / Chromium /
+  Edge / Brave del sistema → ofrece la descarga. `--download-browser` fuerza
+  el shell pineado (píxeles reproducibles entre máquinas); `--no-download`
+  lo prohíbe (CI hermético).
+
+## Encoders
+
+Si el ffmpeg local trae VideoToolbox (macOS), los presets usan el encoder por
+hardware — medido ~3× más rápido con ~1/8 de CPU y calidad de masterización
+equivalente — y caen a software (`prores_ks`/`libx264`) en cualquier otra
+máquina. La TUI y `--plain` indican cuál quedó activo.
 
 ## TUI
 
@@ -34,13 +47,22 @@ en su tab (proceso renderer independiente de Chrome).
 
 ## Presets
 
-| preset        | codec                | uso                                    |
-| ------------- | -------------------- | -------------------------------------- |
-| `prores4444`  | ProRes 4444 12-bit   | masterización / edición (default)      |
-| `prores422hq` | ProRes 422 HQ 10-bit | edición, la mitad de peso              |
-| `h264`        | H.264 CRF 17         | publicación directa                    |
+| preset        | codec / salida            | uso                                            |
+| ------------- | ------------------------- | ---------------------------------------------- |
+| `prores4444`  | ProRes 4444 (alfa)        | masterización / edición (default)              |
+| `prores422hq` | ProRes 422 HQ             | edición, la mitad de peso                      |
+| `prores422`   | ProRes 422 estándar       | edición, aún más liviano                       |
+| `h264`        | H.264 `.mp4`              | publicación universal                          |
+| `hevc`        | H.265 `.mp4` (tag hvc1)   | mejor tamaño/calidad moderna                   |
+| `hevc-alpha`  | H.265 `.mov` con alfa     | transparencia en Safari/iOS (solo VideoToolbox)|
+| `webm-alpha`  | VP9 `.webm` con alfa      | transparencia en Chrome/Firefox/Edge           |
+| `png-seq`     | directorio de PNGs        | compositing en NLE/AE (stream copy, bit-exacto)|
 
-Con `--scale 2` (default) un lienzo de 1080×1080 sale a 2160×2160.
+Con `--scale 2` (default) un lienzo de 1080×1080 sale a 2160×2160. Para
+transparencia real la composición no debe pintar su propio fondo. Nota de
+`hevc-alpha`: ffprobe reporta `yuv420p` aunque el alfa está (viaja en capa
+auxiliar HEVC); Safari lo reproduce, Chrome/Firefox no — para web sirve
+`hevc-alpha` + `webm-alpha` juntos.
 
 ## Flags
 
@@ -51,7 +73,9 @@ Con `--scale 2` (default) un lienzo de 1080×1080 sale a 2160×2160.
 --workers 3         exports en paralelo
 --out-dir DIR       salida (default: junto a cada proyecto)
 --max-seconds N     corta el export (para pruebas)
---chrome RUTA       binario de Chrome
+--browser RUTA      binario del navegador (también env DCX_BROWSER)
+--download-browser  descarga (si hace falta) y usa el headless-shell pineado
+--no-download       nunca descargar el navegador
 --plain             sin TUI (también se activa si no hay terminal)
 ```
 

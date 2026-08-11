@@ -50,6 +50,7 @@ type Model struct {
 	files    []string
 	selected map[int]bool
 	cursor   int
+	meta     string
 
 	opt        export.Options
 	fpsIdx     int
@@ -71,11 +72,12 @@ type Model struct {
 }
 
 // New crea el modelo con los proyectos descubiertos y las opciones iniciales.
-func New(files []string, opt export.Options) Model {
+func New(files []string, opt export.Options, meta string) Model {
 	m := Model{
 		files:    files,
 		selected: map[int]bool{},
 		opt:      opt,
+		meta:     meta,
 		bar:      progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
 		spin:     spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		width:    100,
@@ -104,8 +106,8 @@ func indexOf(xs []int, v int) int {
 }
 
 // Run lanza el programa Bubble Tea y devuelve el error del export (si hubo).
-func Run(files []string, opt export.Options) error {
-	final, err := tea.NewProgram(New(files, opt), tea.WithAltScreen()).Run()
+func Run(files []string, opt export.Options, meta string) error {
+	final, err := tea.NewProgram(New(files, opt, meta), tea.WithAltScreen()).Run()
 	if err != nil {
 		return err
 	}
@@ -231,8 +233,15 @@ func (m Model) handlePickKey(key string) (tea.Model, tea.Cmd) {
 		m.scaleIdx = (m.scaleIdx + 1) % len(scaleOptions)
 		m.opt.Scale = scaleOptions[m.scaleIdx]
 	case "p":
-		m.presetIdx = (m.presetIdx + 1) % len(export.Presets())
-		m.opt.Preset = export.Presets()[m.presetIdx]
+		all := export.Presets()
+		for i := 1; i <= len(all); i++ {
+			idx := (m.presetIdx + i) % len(all)
+			if all[idx].Supported(m.opt.Caps) {
+				m.presetIdx = idx
+				m.opt.Preset = all[idx]
+				break
+			}
+		}
 	case "w":
 		m.workersIdx = (m.workersIdx + 1) % len(workerRange)
 		m.opt.Workers = workerRange[m.workersIdx]
@@ -274,7 +283,11 @@ func (m Model) startRun() (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	var b strings.Builder
-	b.WriteString(headerBox.Render(titleStyle.Render("dcx") + subtleStyle.Render("  ·  .dc.html → video")))
+	header := titleStyle.Render("dcx") + subtleStyle.Render("  ·  .dc.html → video")
+	if m.meta != "" {
+		header += subtleStyle.Render("  ·  " + m.meta)
+	}
+	b.WriteString(headerBox.Render(header))
 	b.WriteString("\n")
 	switch m.phase {
 	case phasePick:
@@ -289,12 +302,16 @@ func (m Model) View() string {
 
 func (m Model) settingsLine() string {
 	p := m.opt.Preset
+	enc := "software"
+	if _, hw := p.Args(m.opt.Caps); hw {
+		enc = "videotoolbox"
+	}
 	return settingStyle.Render(fmt.Sprintf("%s %d fps   %s %dx   %s %s   %s %d workers",
 		settingKey.Render("f"), m.opt.FPS,
 		settingKey.Render("s"), m.opt.Scale,
 		settingKey.Render("p"), p.Name,
 		settingKey.Render("w"), m.opt.Workers,
-	))
+	)) + subtleStyle.Render("   "+enc)
 }
 
 func (m Model) viewPick(b *strings.Builder) {
