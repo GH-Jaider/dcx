@@ -15,8 +15,18 @@ dcx --plain --preset h264 proyectos/   # sin TUI (scripts/CI)
 
 ```bash
 git clone https://github.com/GH-Jaider/dcx && cd dcx
-make install   # go install ./cmd/dcx
+make install   # go install ./cmd/dcx → ~/go/bin/dcx
 ```
+
+`go install` deja el binario en `~/go/bin` (o `$GOBIN`). Si ese directorio
+no está en tu PATH, añádelo una vez:
+
+```bash
+# zsh (macOS)
+echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
+
+Alternativa sin instalar: `make build` y usar `./bin/dcx` directo.
 
 Necesita `ffmpeg` en el PATH. El motor de render se lo consigue solo:
 usa tu Chrome/Chromium si existe, o descarga `chrome-headless-shell`
