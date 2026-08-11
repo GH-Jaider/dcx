@@ -1,0 +1,4 @@
+bin/
+*.mov
+*.mp4
+.DS_Store
