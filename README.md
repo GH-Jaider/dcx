@@ -61,7 +61,28 @@ rápido); en cualquier otra máquina cae a software solo.
 ## Cómo funciona
 
 Cada proyecto se sirve por HTTP, se abre en un tab de Chrome headless
-(chromedp) y se renderiza con el protocolo determinístico del runtime dc:
-un evento de seek síncrono deja el DOM en el frame exacto, se captura el
-PNG y se canaliza directo a ffmpeg. Sin frames en disco, sin Node, sin
+(chromedp) y se renderiza frame a frame con uno de dos protocolos:
+
+- **Runtime om** — la composición expone el svg exportable del runtime dc:
+  un evento de seek síncrono deja el DOM en el frame exacto. La duración la
+  declara la propia composición.
+- **Composiciones CSS** — proyectos animados con `@keyframes` puros (los
+  `.dc.html` de Claude Design, por ejemplo): dcx congela todas las
+  animaciones con la Web Animations API y las posa en el tiempo exacto de
+  cada frame.
+
+Cada PNG se canaliza directo a ffmpeg. Sin frames en disco, sin Node, sin
 Playwright — Go puro y dos binarios (navegador + ffmpeg).
+
+## Duración (composiciones CSS)
+
+Prioridad de mayor a menor:
+
+1. **Declarada en el archivo** — atributos en cualquier elemento (segundos):
+   `data-export-secs="12"` fija el largo, o `data-export-in="1"`
+   `data-export-out="9"` exportan solo esa ventana.
+2. **Inferida de los keyframes** — el ciclo más largo entre las animaciones
+   `infinite`, o el final de la más tardía de las finitas. Ojo con los
+   loops ambiente lentos (una órbita de 90s manda sobre todo lo demás).
+
+`--max-seconds N` recorta cualquiera de las dos por encima.

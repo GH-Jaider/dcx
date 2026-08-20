@@ -1,9 +1,17 @@
 // Package export renderiza proyectos .dc.html a video, frame a frame y de
-// forma determinística, usando el protocolo de export del runtime dc: el
-// evento `data-om-seek-to-time-frame` con sync:true sobre el
-// `svg[data-om-exportable-video-with-duration-secs]` deja el DOM en el frame
-// exacto en cuanto dispatchEvent retorna; un screenshot de ese svg es el
-// frame. Los PNG se canalizan directo al stdin de ffmpeg.
+// forma determinística. Dos protocolos:
+//
+//   - Runtime om: el evento `data-om-seek-to-time-frame` con sync:true sobre
+//     el `svg[data-om-exportable-video-with-duration-secs]` deja el DOM en el
+//     frame exacto en cuanto dispatchEvent retorna; un screenshot de ese svg
+//     es el frame.
+//   - Composiciones CSS (sin svg exportable): se congelan todas las
+//     animaciones con la Web Animations API (pause + currentTime) y se busca
+//     cada frame ahí; la duración sale de los propios keyframes (el ciclo más
+//     largo entre las animaciones infinitas, o el final de la más tardía de
+//     las finitas).
+//
+// Los PNG se canalizan directo al stdin de ffmpeg.
 package export
 
 import (
@@ -22,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/page"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
@@ -29,6 +38,10 @@ import (
 )
 
 const sel = `svg[data-om-exportable-video-with-duration-secs]`
+
+// stageExpr localiza la raíz visual de una composición CSS: el lienzo marcado
+// (convención de los proyectos dc), o el root donde monta el runtime.
+const stageExpr = `(document.querySelector('[data-screen-label]') || document.getElementById('dc-root') || document.body)`
 
 // Stage es la fase en la que está un job.
 type Stage int
@@ -176,40 +189,126 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 
 	bootCtx, cancelBoot := context.WithTimeout(tabCtx, 2*time.Minute)
 	defer cancelBoot()
-	prep := `(async () => {
-		await document.fonts.ready;
-		const el = document.querySelector('` + sel + `');
-		el.style.transform = 'scale(1)';
-		el.style.boxShadow = 'none';
-		return true;
-	})()`
-	var duration float64
-	var box svgBox
-	var syncSeek bool
+	// Lista cuando aparece el svg del protocolo om, o — composiciones CSS —
+	// cuando el runtime ya montó y hay animaciones que manejar. El fondo por
+	// defecto va transparente para que los presets con alpha lo conserven
+	// donde la página no pinta.
+	ready := `!!document.querySelector('` + sel + `') || (!!document.getElementById('dc-root') && document.getAnimations().length > 0)`
 	if err := chromedp.Run(bootCtx,
 		emulation.SetDeviceMetricsOverride(1400, 1400, float64(opt.Scale), false),
+		emulation.SetDefaultBackgroundColorOverride().WithColor(&cdp.RGBA{R: 0, G: 0, B: 0, A: 0}),
 		chromedp.Navigate(pageURL),
-		chromedp.Poll(`!!document.querySelector('`+sel+`')`, nil, chromedp.WithPollingInterval(150*time.Millisecond)),
-		chromedp.Evaluate(prep, nil, awaitPromise),
+		chromedp.Poll(ready, nil, chromedp.WithPollingInterval(150*time.Millisecond)),
 	); err != nil {
+		if errors.Is(err, chromedp.ErrPollingTimeout) {
+			err = errors.New("la composición nunca se montó: no apareció el svg exportable ni ninguna animación CSS")
+		}
 		return fail(fmt.Errorf("arrancando la composición: %w", err))
 	}
-	// El runtime inyecta las @font-face dentro del svg y lo marca; esperarlo
-	// evita frames tempranos con fuentes de fallback. Best-effort con timeout
-	// corto: un runtime viejo sin el atributo no debe pagar una espera larga
-	// (document.fonts.ready ya se esperó arriba).
-	fontsCtx, cancelFonts := context.WithTimeout(tabCtx, 4*time.Second)
-	_ = chromedp.Run(fontsCtx, chromedp.Poll(
-		`document.querySelector('`+sel+`').getAttribute('data-om-fonts-inlined') === 'true'`,
-		nil, chromedp.WithPollingInterval(100*time.Millisecond)))
-	cancelFonts()
-	if err := chromedp.Run(bootCtx,
-		chromedp.Sleep(150*time.Millisecond),
-		chromedp.Evaluate(`+document.querySelector('`+sel+`').getAttribute('data-om-exportable-video-with-duration-secs')`, &duration),
-		chromedp.Evaluate(`document.querySelector('`+sel+`').getAttribute('data-om-sync-seek') === 'true'`, &syncSeek),
-		chromedp.Evaluate(`(() => { const r = document.querySelector('`+sel+`').getBoundingClientRect(); return {x: r.x, y: r.y, w: r.width, h: r.height}; })()`, &box),
-	); err != nil {
+	var hasOM bool
+	if err := chromedp.Run(bootCtx, chromedp.Evaluate(`!!document.querySelector('`+sel+`')`, &hasOM)); err != nil {
 		return fail(fmt.Errorf("arrancando la composición: %w", err))
+	}
+	if !hasOM {
+		// Gracia corta por si el runtime om monta el svg después de que ya
+		// corren animaciones; si no llega, es una composición CSS.
+		graceCtx, cancelGrace := context.WithTimeout(tabCtx, 3*time.Second)
+		if chromedp.Run(graceCtx, chromedp.Poll(`!!document.querySelector('`+sel+`')`, nil, chromedp.WithPollingInterval(100*time.Millisecond))) == nil {
+			hasOM = true
+		}
+		cancelGrace()
+	}
+
+	var duration, seekFrom float64
+	var box svgBox
+	var syncSeek bool
+	if hasOM {
+		prep := `(async () => {
+			await document.fonts.ready;
+			const el = document.querySelector('` + sel + `');
+			el.style.transform = 'scale(1)';
+			el.style.boxShadow = 'none';
+			return true;
+		})()`
+		if err := chromedp.Run(bootCtx, chromedp.Evaluate(prep, nil, awaitPromise)); err != nil {
+			return fail(fmt.Errorf("arrancando la composición: %w", err))
+		}
+		// El runtime inyecta las @font-face dentro del svg y lo marca; esperarlo
+		// evita frames tempranos con fuentes de fallback. Best-effort con timeout
+		// corto: un runtime viejo sin el atributo no debe pagar una espera larga
+		// (document.fonts.ready ya se esperó arriba).
+		fontsCtx, cancelFonts := context.WithTimeout(tabCtx, 4*time.Second)
+		_ = chromedp.Run(fontsCtx, chromedp.Poll(
+			`document.querySelector('`+sel+`').getAttribute('data-om-fonts-inlined') === 'true'`,
+			nil, chromedp.WithPollingInterval(100*time.Millisecond)))
+		cancelFonts()
+		if err := chromedp.Run(bootCtx,
+			chromedp.Sleep(150*time.Millisecond),
+			chromedp.Evaluate(`+document.querySelector('`+sel+`').getAttribute('data-om-exportable-video-with-duration-secs')`, &duration),
+			chromedp.Evaluate(`document.querySelector('`+sel+`').getAttribute('data-om-sync-seek') === 'true'`, &syncSeek),
+			chromedp.Evaluate(`(() => { const r = document.querySelector('`+sel+`').getBoundingClientRect(); return {x: r.x, y: r.y, w: r.width, h: r.height}; })()`, &box),
+		); err != nil {
+			return fail(fmt.Errorf("arrancando la composición: %w", err))
+		}
+	} else {
+		// Composición CSS pura. El viewport se ajusta exacto al lienzo: el
+		// fit() típico de estos proyectos (scale = min(vw/W, vh/H)) queda en 1
+		// y el stage llena la ventana.
+		prep := `(async () => {
+			await document.fonts.ready;
+			await Promise.all([...document.images].map(i => i.decode().catch(() => {})));
+			const el = ` + stageExpr + `;
+			return {x: 0, y: 0, w: el.offsetWidth, h: el.offsetHeight};
+		})()`
+		var dims svgBox
+		if err := chromedp.Run(bootCtx, chromedp.Evaluate(prep, &dims, awaitPromise)); err != nil {
+			return fail(fmt.Errorf("arrancando la composición: %w", err))
+		}
+		if dims.W < 1 || dims.H < 1 {
+			return fail(errors.New("no pude medir el lienzo de la composición"))
+		}
+		// Congela el reloj (pause + seek 0) y resuelve la ventana a exportar.
+		// Si el proyecto la declara — data-export-secs, o data-export-in /
+		// data-export-out (segundos, en cualquier elemento) — esa manda; si
+		// no, la duración se infiere de los keyframes: el ciclo más largo
+		// entre animaciones infinitas, o el final de la más tardía de las
+		// finitas.
+		freeze := `(() => {
+			const el = ` + stageExpr + `;
+			if (Math.abs(el.getBoundingClientRect().width - el.offsetWidth) > 0.5) el.style.transform = 'scale(1)';
+			let cycle = 0, finite = 0;
+			for (const a of document.getAnimations()) {
+				a.pause();
+				a.currentTime = 0;
+				const t = a.effect.getTiming();
+				const dur = (typeof t.duration === 'number' ? t.duration : 0) / 1000;
+				const delay = (t.delay || 0) / 1000;
+				if (t.iterations === Infinity) cycle = Math.max(cycle, dur);
+				else finite = Math.max(finite, delay + dur * (t.iterations || 1));
+			}
+			const attr = n => { const e = document.querySelector('[' + n + ']'); const v = e ? parseFloat(e.getAttribute(n)) : NaN; return isFinite(v) ? v : NaN; };
+			const secs = attr('data-export-secs'), tin = attr('data-export-in'), tout = attr('data-export-out');
+			const start = tin >= 0 ? tin : 0;
+			let end = Math.max(cycle, finite);
+			if (secs > 0) end = start + secs;
+			if (tout > start) end = tout;
+			return { start: start, len: Math.max(end - start, 0) };
+		})()`
+		var win struct {
+			Start float64 `json:"start"`
+			Len   float64 `json:"len"`
+		}
+		if err := chromedp.Run(bootCtx,
+			emulation.SetDeviceMetricsOverride(int64(math.Round(dims.W)), int64(math.Round(dims.H)), float64(opt.Scale), false),
+			chromedp.Evaluate(`(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))))()`, nil, awaitPromise),
+			chromedp.Sleep(250*time.Millisecond), // ResizeObserver → re-fit del stage
+			chromedp.Evaluate(freeze, &win),
+			chromedp.Evaluate(`(() => { const r = `+stageExpr+`.getBoundingClientRect(); return {x: r.x, y: r.y, w: r.width, h: r.height}; })()`, &box),
+		); err != nil {
+			return fail(fmt.Errorf("arrancando la composición: %w", err))
+		}
+		duration = win.Len
+		seekFrom = win.Start
 	}
 	if opt.MaxSeconds > 0 {
 		duration = math.Min(duration, opt.MaxSeconds)
@@ -254,7 +353,12 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 			return ffFail(err)
 		}
 		t := math.Min(float64(i)/float64(opt.FPS), duration-1e-4)
-		seek := fmt.Sprintf(`document.querySelector('%s').dispatchEvent(new CustomEvent('data-om-seek-to-time-frame', { detail: { time: %g, sync: true } }))`, sel, t)
+		var seek string
+		if hasOM {
+			seek = fmt.Sprintf(`document.querySelector('%s').dispatchEvent(new CustomEvent('data-om-seek-to-time-frame', { detail: { time: %g, sync: true } }))`, sel, t)
+		} else {
+			seek = fmt.Sprintf(`(() => { for (const a of document.getAnimations()) { a.pause(); a.currentTime = %g; } })()`, (seekFrom+t)*1000)
+		}
 		actions := []chromedp.Action{chromedp.Evaluate(seek, nil)}
 		if !syncSeek {
 			actions = append(actions, chromedp.Evaluate(rafSettle, nil, awaitPromise))
