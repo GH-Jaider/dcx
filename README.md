@@ -33,6 +33,23 @@ usa tu Chrome/Chromium si existe, o descarga `chrome-headless-shell`
 (~95 MB, una sola vez) con tu permiso. `--download-browser` /
 `--no-download` para scripts y CI.
 
+## ¿Algo falla? `doctor.sh`
+
+Un solo comando revisa la instalación, la carpeta de proyectos y la red, y
+termina con un export de prueba. Imprime un reporte legible para mandar por
+chat:
+
+```bash
+bash doctor.sh "/ruta/a/la carpeta con los .dc.html"
+```
+
+`dcx --version` imprime el commit compilado — útil para saber a distancia si
+una máquina quedó con un binario viejo.
+
+**Importante**: los `.dc.html` no funcionan sueltos. Necesitan al lado sus
+archivos del export (`support.js`, `_ds/`, `assets/`, `uploads/`); al mover
+proyectos hay que llevarse la carpeta completa.
+
 ## Presets
 
 | preset | salida |

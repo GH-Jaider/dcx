@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,11 +31,16 @@ func main() {
 	noDownload := flag.Bool("no-download", false, "nunca descargar el navegador (falla si no hay ninguno)")
 	outDir := flag.String("out-dir", "", "carpeta de salida (default: junto a cada proyecto)")
 	plain := flag.Bool("plain", false, "sin TUI: logs planos (se activa solo si no hay terminal)")
+	showVersion := flag.Bool("version", false, "imprime la versión compilada y sale")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "uso: dcx [flags] [archivo.dc.html | carpeta]...\n\nSin argumentos busca proyectos .dc.html en el directorio actual.\n\nflags:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
 	if *downloadBrowser && *noDownload {
 		fatal(fmt.Errorf("--download-browser y --no-download son contradictorios"))
 	}
@@ -213,6 +219,37 @@ func runPlain(ctx context.Context, files []string, opt export.Options) error {
 		}
 	}
 	return export.Run(ctx, files, opt, report)
+}
+
+// versionString arma la versión desde los datos que Go estampa al compilar
+// dentro de un repo git. Sirve para saber, a distancia, si una máquina corre
+// un binario viejo.
+func versionString() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dcx (versión desconocida)"
+	}
+	var rev, when, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			if len(s.Value) > 7 {
+				rev = s.Value[:7]
+			} else {
+				rev = s.Value
+			}
+		case "vcs.time":
+			when = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = " (con cambios locales)"
+			}
+		}
+	}
+	if rev == "" {
+		return "dcx (compilado fuera del repo git)"
+	}
+	return fmt.Sprintf("dcx %s · %s%s", rev, when, dirty)
 }
 
 func fatal(err error) {
