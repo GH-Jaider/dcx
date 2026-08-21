@@ -192,6 +192,38 @@ func awaitPromise(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
 	return p.WithAwaitPromise(true)
 }
 
+// dcxDebug traza los pasos del arranque a stderr con DCX_DEBUG=1. Existe para
+// diagnosticar en máquinas ajenas: el paso exacto y su duración dicen más que
+// cualquier suposición sobre la red del otro.
+var dcxDebug = os.Getenv("DCX_DEBUG") != ""
+
+func trace(job int, step string, start time.Time, err error) {
+	if !dcxDebug {
+		return
+	}
+	status := "ok"
+	if err != nil {
+		status = "FALLA: " + err.Error()
+	}
+	fmt.Fprintf(os.Stderr, "[dcx-debug job %d] %-28s %6.2fs %s\n", job, step, time.Since(start).Seconds(), status)
+}
+
+// runStep ejecuta acciones dejando traza del paso.
+func runStep(ctx context.Context, job int, step string, actions ...chromedp.Action) error {
+	t0 := time.Now()
+	err := chromedp.Run(ctx, actions...)
+	trace(job, step, t0, err)
+	return err
+}
+
+// rafSettleJS espera dos frames de compositor para que el DOM llegue a
+// pintarse, PERO con tope: el Chrome del sistema en headless nuevo no tiene
+// ventana que pintar y ahí requestAnimationFrame no se dispara nunca. Sin el
+// tope el export se cuelga esperando un frame que no va a existir.
+const rafSettleJS = `(async () => {` + capJS + `
+	return cap(new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))), 200);
+})()`
+
 // assetWarn nombra lo que no cargó, para no dejar al usuario adivinando si el
 // culpable es su red o la carpeta del proyecto.
 func assetWarn(pending string) string {
@@ -274,6 +306,9 @@ func probeHosts(ctx context.Context, origins []string) (dead []string) {
 		// contexto de ejecución viciado y el poll posterior nunca ve la página.
 		tab, cancelTab := chromedp.NewContext(ctx)
 		defer cancelTab()
+		if err := chromedp.Run(tab); err != nil { // materializa el target (ver runJob)
+			return dead
+		}
 		pctx, cancel := context.WithTimeout(tab, 12*time.Second)
 		defer cancel()
 		probe := `(async () => {
@@ -434,9 +469,16 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 	defer srv.Close()
 	pageURL := fmt.Sprintf("http://%s/%s", ln.Addr(), url.PathEscape(filepath.Base(project)))
 
-	// Tab propio dentro del Chrome compartido.
+	// Tab propio dentro del Chrome compartido. El Run vacío materializa el
+	// target con el contexto del tab: chromedp ata el target al contexto del
+	// PRIMER Run, y si ese es uno derivado con timeout, al cancelarlo mata el
+	// target y todo lo que siga se cuelga hasta agotar su plazo. El Chrome del
+	// sistema lo castiga sin piedad; headless-shell lo toleraba.
 	tabCtx, cancelTab := chromedp.NewContext(browserCtx)
 	defer cancelTab()
+	if err := runStep(tabCtx, job, "materializar tab"); err != nil {
+		return fail(fmt.Errorf("abriendo el tab: %w", err))
+	}
 
 	bootCtx, cancelBoot := context.WithTimeout(tabCtx, 2*time.Minute)
 	defer cancelBoot()
@@ -461,7 +503,7 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 		report(Progress{Job: job, Stage: StageBooting, Warn: "sin acceso a " + strings.Join(dead, ", ") + "; se exporta con las fuentes de reserva"})
 	}
 
-	if err := chromedp.Run(bootCtx, append(blockActions,
+	if err := runStep(bootCtx, job, "navegar+esperar montaje", append(blockActions,
 		emulation.SetDeviceMetricsOverride(1400, 1400, float64(opt.Scale), false),
 		emulation.SetDefaultBackgroundColorOverride().WithColor(&cdp.RGBA{R: 0, G: 0, B: 0, A: 0}),
 		chromedp.Navigate(pageURL),
@@ -477,7 +519,7 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 		return fail(bootErr(tabCtx, err))
 	}
 	var hasOM bool
-	if err := chromedp.Run(bootCtx, chromedp.Evaluate(`!!document.querySelector('`+sel+`')`, &hasOM)); err != nil {
+	if err := runStep(bootCtx, job, "detectar protocolo om", chromedp.Evaluate(`!!document.querySelector('`+sel+`')`, &hasOM)); err != nil {
 		return fail(bootErr(tabCtx, err))
 	}
 	if !hasOM {
@@ -501,7 +543,7 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 			return pending;
 		})()`
 		var pending string
-		if err := chromedp.Run(bootCtx, chromedp.Evaluate(prep, &pending, awaitPromise)); err != nil {
+		if err := runStep(bootCtx, job, "esperar fuentes (om)", chromedp.Evaluate(prep, &pending, awaitPromise)); err != nil {
 			return fail(bootErr(tabCtx, err))
 		}
 		if pending != "" {
@@ -517,7 +559,7 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 			`document.querySelector('`+sel+`').getAttribute('data-om-fonts-inlined') === 'true'`,
 			nil, chromedp.WithPollingInterval(100*time.Millisecond)))
 		cancelFonts()
-		if err := chromedp.Run(bootCtx,
+		if err := runStep(bootCtx, job, "leer duración (om)",
 			chromedp.Sleep(150*time.Millisecond),
 			chromedp.Evaluate(`+document.querySelector('`+sel+`').getAttribute('data-om-exportable-video-with-duration-secs')`, &duration),
 			chromedp.Evaluate(`document.querySelector('`+sel+`').getAttribute('data-om-sync-seek') === 'true'`, &syncSeek),
@@ -538,7 +580,7 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 			W       float64 `json:"w"`
 			H       float64 `json:"h"`
 		}
-		if err := chromedp.Run(bootCtx, chromedp.Evaluate(prep, &probe, awaitPromise)); err != nil {
+		if err := runStep(bootCtx, job, "esperar fuentes (css)", chromedp.Evaluate(prep, &probe, awaitPromise)); err != nil {
 			return fail(bootErr(tabCtx, err))
 		}
 		dims := svgBox{W: probe.W, H: probe.H}
@@ -580,9 +622,9 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 			Start float64 `json:"start"`
 			Len   float64 `json:"len"`
 		}
-		if err := chromedp.Run(bootCtx,
+		if err := runStep(bootCtx, job, "medir y congelar (css)",
 			emulation.SetDeviceMetricsOverride(int64(math.Round(dims.W)), int64(math.Round(dims.H)), float64(opt.Scale), false),
-			chromedp.Evaluate(`(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))))()`, nil, awaitPromise),
+			chromedp.Evaluate(rafSettleJS, nil, awaitPromise),
 			chromedp.Sleep(250*time.Millisecond), // ResizeObserver → re-fit del stage
 			chromedp.Evaluate(freeze, &win),
 			chromedp.Evaluate(`(() => { const r = `+stageExpr+`.getBoundingClientRect(); return {x: r.x, y: r.y, w: r.width, h: r.height}; })()`, &box),
@@ -629,7 +671,6 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 	clip := &page.Viewport{X: box.X, Y: box.Y, Width: box.W, Height: box.H, Scale: 1}
 	// Sin flushSync anunciado (data-om-sync-seek) el commit del seek es
 	// asíncrono: hay que dejar pasar dos frames de compositor antes de capturar.
-	const rafSettle = `(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))))()`
 	for i := 0; i < frames; i++ {
 		if err := appCtx.Err(); err != nil {
 			return ffFail(err)
@@ -643,7 +684,7 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 		}
 		actions := []chromedp.Action{chromedp.Evaluate(seek, nil)}
 		if !syncSeek {
-			actions = append(actions, chromedp.Evaluate(rafSettle, nil, awaitPromise))
+			actions = append(actions, chromedp.Evaluate(rafSettleJS, nil, awaitPromise))
 		}
 		var shot []byte
 		actions = append(actions, chromedp.ActionFunc(func(c context.Context) error {
