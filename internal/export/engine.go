@@ -17,6 +17,7 @@ package export
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -55,11 +56,18 @@ const stageExpr = `(document.querySelector('[data-screen-label]') || document.ge
 const capJS = `const cap = (p, ms) => Promise.race([Promise.resolve(p).catch(() => {}), new Promise(r => setTimeout(r, ms))]);`
 
 // assetsWait es lo que se espera antes de capturar: fuentes e imágenes, cada
-// una con su tope. Devuelve si las fuentes alcanzaron a asentarse.
+// una con su tope. Deja en `pending` qué quedó sin cargar — la familia de la
+// fuente, no un "algo falló": saber si es la del CDN o una local del proyecto
+// es la diferencia entre culpar a la red o a la carpeta.
 const assetsWait = capJS + `
 	await cap(document.fonts.ready, 10000);
 	await cap(Promise.all([...document.images].map(i => i.decode().catch(() => {}))), 5000);
-	const fontsOK = document.fonts.status === 'loaded';`
+	const slowFonts = [...new Set([...document.fonts].filter(f => f.status === 'loading').map(f => f.family))];
+	const slowImgs = [...document.images].filter(i => !i.complete).length;
+	const pending = [
+		...(slowFonts.length ? ['la fuente ' + slowFonts.slice(0, 3).join(', ')] : []),
+		...(slowImgs ? [slowImgs + ' imagen(es)'] : []),
+	].join(' y ');`
 
 // Stage es la fase en la que está un job.
 type Stage int
@@ -184,7 +192,11 @@ func awaitPromise(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
 	return p.WithAwaitPromise(true)
 }
 
-const assetWarn = "algunas fuentes o imágenes no cargaron a tiempo; se exporta con las de reserva (¿proxy o firewall bloqueando el CDN?)"
+// assetWarn nombra lo que no cargó, para no dejar al usuario adivinando si el
+// culpable es su red o la carpeta del proyecto.
+func assetWarn(pending string) string {
+	return "no cargó a tiempo " + pending + "; se exporta con las de reserva"
+}
 
 // hostRe saca los orígenes externos que referencian los archivos del proyecto,
 // con su esquema: sondear en http lo que el proyecto pide por http evita dar
@@ -239,41 +251,49 @@ func externalHosts(project string) []string {
 // hoja de estilos remota: un dominio que traga la petición sin contestar (un
 // proxy corporativo) congela la página entera hasta que vence el timeout de
 // TCP. Detectarlos aquí cuesta segundos y permite bloquearlos.
+// La sonda corre DENTRO del tab, no desde Go: Chrome usa el proxy del sistema,
+// las políticas del equipo y su propio DNS, así que un curl desde Go puede
+// llegar a un host al que la página nunca llegará (y al revés).
 func probeHosts(ctx context.Context, origins []string) (dead []string) {
-	pctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-	defer cancel()
-	client := &http.Client{Timeout: 5 * time.Second}
-	var mu sync.Mutex
-	var wg sync.WaitGroup
+	var ask []string
 	for _, o := range origins {
-		if alive, done := probeCached(o); done {
+		if alive, known := probeCached(o); known {
 			if !alive {
 				dead = append(dead, hostOf(o))
 			}
 			continue
 		}
-		wg.Add(1)
-		go func(origin string) {
-			defer wg.Done()
-			alive := true
-			req, err := http.NewRequestWithContext(pctx, http.MethodHead, origin+"/", nil)
-			if err != nil {
-				return
-			}
-			if resp, err := client.Do(req); err != nil {
-				alive = false
-			} else {
-				resp.Body.Close()
-			}
-			probeStore(origin, alive)
-			if !alive {
-				mu.Lock()
-				dead = append(dead, hostOf(origin))
-				mu.Unlock()
-			}
-		}(o)
+		ask = append(ask, o)
 	}
-	wg.Wait()
+	if len(ask) > 0 {
+		list, err := json.Marshal(ask)
+		if err != nil {
+			return dead
+		}
+		// En un tab aparte: evaluar en el tab del job antes de navegar deja su
+		// contexto de ejecución viciado y el poll posterior nunca ve la página.
+		tab, cancelTab := chromedp.NewContext(ctx)
+		defer cancelTab()
+		pctx, cancel := context.WithTimeout(tab, 12*time.Second)
+		defer cancel()
+		probe := `(async () => {
+			const reach = async u => { const c = new AbortController(); const t = setTimeout(() => c.abort(), 5000);
+				try { await fetch(u + '/', { mode: 'no-cors', cache: 'no-store', signal: c.signal }); return true; }
+				catch { return false; } finally { clearTimeout(t); } };
+			const origins = ` + string(list) + `;
+			return Object.fromEntries(await Promise.all(origins.map(async o => [o, await reach(o)])));
+		})()`
+		alive := map[string]bool{}
+		if err := chromedp.Run(pctx, chromedp.Navigate("about:blank"), chromedp.Evaluate(probe, &alive, awaitPromise)); err != nil {
+			return dead // sin veredicto: mejor seguir que bloquear a ciegas
+		}
+		for origin, ok := range alive {
+			probeStore(origin, ok)
+			if !ok {
+				dead = append(dead, hostOf(origin))
+			}
+		}
+	}
 	sort.Strings(dead)
 	return slices.Compact(dead)
 }
@@ -429,7 +449,7 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 	// Los dominios que no contestan se bloquean antes de navegar: si no, la
 	// página queda congelada esperándolos y ni siquiera arranca el runtime.
 	blockActions := []chromedp.Action{}
-	if dead := probeHosts(appCtx, externalHosts(project)); len(dead) > 0 {
+	if dead := probeHosts(browserCtx, externalHosts(project)); len(dead) > 0 {
 		if slices.Contains(dead, "unpkg.com") {
 			return fail(errors.New("sin acceso a unpkg.com — el runtime dc carga React desde ese CDN; revisa internet, VPN, proxy o firewall"))
 		}
@@ -478,14 +498,14 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 			const el = document.querySelector('` + sel + `');
 			el.style.transform = 'scale(1)';
 			el.style.boxShadow = 'none';
-			return fontsOK;
+			return pending;
 		})()`
-		var fontsOK bool
-		if err := chromedp.Run(bootCtx, chromedp.Evaluate(prep, &fontsOK, awaitPromise)); err != nil {
+		var pending string
+		if err := chromedp.Run(bootCtx, chromedp.Evaluate(prep, &pending, awaitPromise)); err != nil {
 			return fail(bootErr(tabCtx, err))
 		}
-		if !fontsOK {
-			report(Progress{Job: job, Stage: StageBooting, Warn: assetWarn})
+		if pending != "" {
+			report(Progress{Job: job, Stage: StageBooting, Warn: assetWarn(pending)})
 			dropPending(bootCtx)
 		}
 		// El runtime inyecta las @font-face dentro del svg y lo marca; esperarlo
@@ -511,14 +531,19 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 		// y el stage llena la ventana.
 		prep := `(async () => {` + assetsWait + `
 			const el = ` + stageExpr + `;
-			return {x: fontsOK ? 1 : 0, y: 0, w: el.offsetWidth, h: el.offsetHeight};
+			return {pending: pending, w: el.offsetWidth, h: el.offsetHeight};
 		})()`
-		var dims svgBox
-		if err := chromedp.Run(bootCtx, chromedp.Evaluate(prep, &dims, awaitPromise)); err != nil {
+		var probe struct {
+			Pending string  `json:"pending"`
+			W       float64 `json:"w"`
+			H       float64 `json:"h"`
+		}
+		if err := chromedp.Run(bootCtx, chromedp.Evaluate(prep, &probe, awaitPromise)); err != nil {
 			return fail(bootErr(tabCtx, err))
 		}
-		if dims.X == 0 {
-			report(Progress{Job: job, Stage: StageBooting, Warn: assetWarn})
+		dims := svgBox{W: probe.W, H: probe.H}
+		if probe.Pending != "" {
+			report(Progress{Job: job, Stage: StageBooting, Warn: assetWarn(probe.Pending)})
 			dropPending(bootCtx)
 		}
 		if dims.W < 1 || dims.H < 1 {
