@@ -165,6 +165,43 @@ func awaitPromise(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
 	return p.WithAwaitPromise(true)
 }
 
+// diagnoseBoot inspecciona la página tras un boot fallido para explicar por
+// qué no montó: sin acceso al CDN del runtime, React sin cargar, etc. Devuelve
+// "" si no logra averiguarlo.
+func diagnoseBoot(tabCtx context.Context) string {
+	dctx, cancel := context.WithTimeout(tabCtx, 8*time.Second)
+	defer cancel()
+	var d struct {
+		DcRoot  bool `json:"dcRoot"`
+		React   bool `json:"react"`
+		Anims   int  `json:"anims"`
+		Support int  `json:"support"`
+		Unpkg   bool `json:"unpkg"`
+	}
+	probe := `(async () => {
+		const out = { dcRoot: !!document.getElementById('dc-root'), react: !!window.React, anims: document.getAnimations().length, support: 0, unpkg: false };
+		try { out.support = (await fetch('support.js', { method: 'HEAD', cache: 'no-store' })).status; } catch { out.support = -1; }
+		try { await fetch('https://unpkg.com/react@18.3.1/package.json', { method: 'HEAD', mode: 'no-cors', cache: 'no-store' }); out.unpkg = true; } catch {}
+		return out;
+	})()`
+	if err := chromedp.Run(dctx, chromedp.Evaluate(probe, &d, awaitPromise)); err != nil {
+		return ""
+	}
+	switch {
+	case d.Support != 200:
+		return "no responde ./support.js junto al proyecto — el folder parece incompleto; copia la carpeta completa del export (support.js, _ds/, assets/, uploads/)"
+	case !d.Unpkg:
+		return "sin acceso a unpkg.com — el runtime dc carga React desde ese CDN y necesita internet"
+	case !d.React:
+		return "React no cargó desde unpkg.com (¿proxy o firewall bloqueando el CDN?)"
+	case !d.DcRoot:
+		return "el runtime dc no montó (¿el archivo abre bien en un browser normal?)"
+	case d.Anims == 0:
+		return "montó pero no expone svg exportable ni animaciones CSS"
+	}
+	return ""
+}
+
 func runJob(browserCtx, appCtx context.Context, job int, project string, opt Options, report func(Progress)) error {
 	start := time.Now()
 	fail := func(err error) error {
@@ -172,6 +209,19 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 		return fmt.Errorf("%s: %w", filepath.Base(project), err)
 	}
 	report(Progress{Job: job, Stage: StageBooting})
+
+	// El error más común al copiar proyectos: llevarse los .dc.html sin los
+	// archivos de al lado. Sin sus scripts la página nunca monta, así que
+	// mejor fallar al instante y con nombre que esperar el timeout del boot.
+	if html, err := os.ReadFile(project); err == nil {
+		for _, ref := range []string{"support.js", "image-slot.js"} {
+			if bytes.Contains(html, []byte(ref)) {
+				if _, err := os.Stat(filepath.Join(filepath.Dir(project), ref)); err != nil {
+					return fail(fmt.Errorf("el proyecto referencia ./%s pero no está junto al archivo — copia la carpeta completa del export (support.js, _ds/, assets/, uploads/)", ref))
+				}
+			}
+		}
+	}
 
 	// Servidor efímero del directorio del proyecto (support.js, jsx, uploads…).
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -200,8 +250,12 @@ func runJob(browserCtx, appCtx context.Context, job int, project string, opt Opt
 		chromedp.Navigate(pageURL),
 		chromedp.Poll(ready, nil, chromedp.WithPollingInterval(150*time.Millisecond)),
 	); err != nil {
-		if errors.Is(err, chromedp.ErrPollingTimeout) {
-			err = errors.New("la composición nunca se montó: no apareció el svg exportable ni ninguna animación CSS")
+		if errors.Is(err, chromedp.ErrPollingTimeout) || errors.Is(err, context.DeadlineExceeded) {
+			msg := "la composición nunca se montó"
+			if why := diagnoseBoot(tabCtx); why != "" {
+				msg += ": " + why
+			}
+			err = errors.New(msg)
 		}
 		return fail(fmt.Errorf("arrancando la composición: %w", err))
 	}
