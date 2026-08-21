@@ -47,9 +47,14 @@ else info "sin navegador aún — dcx ofrecerá descargarlo (~95 MB) la primera 
 
 titulo "3. Internet (el runtime carga React desde un CDN)"
 if curl -sS -m 15 -o /dev/null -w '%{http_code}' https://unpkg.com/react@18.3.1/package.json 2>/dev/null | grep -q '^[23]'; then
-  ok "unpkg.com responde"
+  ok "unpkg.com responde (de ahí sale React)"
 else
   bad "no hay acceso a unpkg.com" "Sin ese CDN las composiciones nunca cargan: revisar internet, VPN, proxy o firewall de la empresa."
+fi
+if curl -sS -m 15 -o /dev/null -w '%{http_code}' 'https://fonts.googleapis.com/css2?family=DM+Sans' 2>/dev/null | grep -q '^[23]'; then
+  ok "fonts.googleapis.com responde (fuentes del design system)"
+else
+  info "sin acceso a fonts.googleapis.com — dcx lo detecta y exporta con las fuentes de reserva"
 fi
 
 titulo "4. La carpeta de proyectos"

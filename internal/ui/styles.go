@@ -41,6 +41,7 @@ type palette struct {
 	glyphWait  lipgloss.Style // ● en cola
 	ok         lipgloss.Style // ✓
 	errText    lipgloss.Style // × y mensajes de error
+	warnText   lipgloss.Style // ! y avisos que no impiden el export
 	subtle     lipgloss.Style
 	faint      lipgloss.Style
 	quiet      lipgloss.Style // estados "cancelando…" (faint+italic)
@@ -82,6 +83,7 @@ func newPalette(isDark bool) palette {
 	p.glyphWait = lipgloss.NewStyle().Foreground(p.fgFaint)
 	p.ok = lipgloss.NewStyle().Foreground(p.accent).Bold(true)
 	p.errText = lipgloss.NewStyle().Foreground(p.errColor)
+	p.warnText = lipgloss.NewStyle().Foreground(ld(lipgloss.Color("#B26B00"), lipgloss.Color("#E0A030")))
 	p.subtle = lipgloss.NewStyle().Foreground(p.fgSubtle)
 	p.faint = lipgloss.NewStyle().Foreground(p.fgFaint)
 	p.quiet = lipgloss.NewStyle().Foreground(p.fgSubtle).Italic(true)

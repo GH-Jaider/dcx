@@ -73,6 +73,12 @@ func main() {
 		fatal(fmt.Errorf("el preset %q necesita encoders que tu ffmpeg no trae (hevc-alpha, por ejemplo, requiere VideoToolbox en Apple Silicon)", preset.Name))
 	}
 
+	if *outDir != "" {
+		if err := os.MkdirAll(*outDir, 0o755); err != nil {
+			fatal(fmt.Errorf("no pude crear la carpeta de salida: %w", err))
+		}
+	}
+
 	opt := export.Options{
 		FPS:         *fps,
 		Scale:       *scale,
@@ -203,6 +209,9 @@ func runPlain(ctx context.Context, files []string, opt export.Options) error {
 		mu.Lock()
 		defer mu.Unlock()
 		name := files[p.Job]
+		if p.Warn != "" {
+			fmt.Printf("[%d] %s: aviso: %s\n", p.Job, name, p.Warn)
+		}
 		switch p.Stage {
 		case export.StageRendering:
 			pct := p.Frame * 100 / max(p.Frames, 1)

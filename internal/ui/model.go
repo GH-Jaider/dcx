@@ -46,6 +46,7 @@ type jobView struct {
 	bytes   int64
 	elapsed time.Duration
 	err     error
+	warn    string
 }
 
 type progressMsg export.Progress
@@ -208,6 +209,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if p.Err != nil {
 				j.err = p.Err
+			}
+			if p.Warn != "" {
+				j.warn = p.Warn
 			}
 		}
 		return m, listen(m.ch, m.done)
@@ -496,7 +500,11 @@ func (m Model) jobLine(j jobView, bar progress.Model, nameW, barW int, showFrame
 		} else if avail+ansi.StringWidth(meta) >= 10 {
 			tail = m.pal.faint.Render("→ ") + m.pal.subtle.Render(ansi.Truncate(filepath.Base(j.out), avail+ansi.StringWidth(meta), "…"))
 		}
-		return m.pal.ok.Render("✓") + " " + m.pal.rowBase.Render(name) + pad + " " +
+		glyph := m.pal.ok.Render("✓")
+		if j.warn != "" {
+			glyph = m.pal.warnText.Render("!")
+		}
+		return glyph + " " + m.pal.rowBase.Render(name) + pad + " " +
 			m.pal.barDone.Render(strings.Repeat("█", barW)) + " " + pct(1) + "  " + tail
 	case j.stage == export.StagePending:
 		return m.pal.glyphWait.Render("●") + " " + m.pal.rowMuted.Render(name) + pad + " " +
@@ -529,6 +537,7 @@ func (m Model) jobLine(j jobView, bar progress.Model, nameW, barW int, showFrame
 func (m Model) viewSummary(b *strings.Builder) {
 	var ok, failed int
 	var bytes int64
+	var warn string
 	for _, j := range m.jobs {
 		switch {
 		case j.err != nil:
@@ -536,6 +545,9 @@ func (m Model) viewSummary(b *strings.Builder) {
 		case j.stage == export.StageDone:
 			ok++
 			bytes += j.bytes
+			if j.warn != "" && warn == "" {
+				warn = j.warn
+			}
 		}
 	}
 	b.WriteString("\n" + m.pal.hairSep.Render(strings.Repeat("─", max(20, m.width-4))) + "\n\n")
@@ -550,6 +562,9 @@ func (m Model) viewSummary(b *strings.Builder) {
 		line += m.pal.errText.Render(fmt.Sprintf("   × %d con error", failed))
 	}
 	b.WriteString(line)
+	if warn != "" {
+		b.WriteString("\n" + m.pal.warnText.Render("! "+ansi.Truncate(warn, max(20, m.width-6), "…")))
+	}
 	b.WriteString(m.helpLine(kExit))
 }
 
